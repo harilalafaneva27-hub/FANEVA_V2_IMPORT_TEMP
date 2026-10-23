@@ -49,9 +49,11 @@ jobs:
       - name: Prepare temporary debug keystore
         shell: bash
         run: |
-          if [ ! -f debug.keystore ]; then
+          set -euo pipefail
+          KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
             keytool -genkeypair -v \
-              -keystore debug.keystore \
+              -keystore "$KEYSTORE" \
               -storepass android \
               -alias androiddebugkey \
               -keypass android \
@@ -60,6 +62,10 @@ jobs:
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
+          test -s "$KEYSTORE"
+          keytool -list -keystore "$KEYSTORE" \
+            -storepass android -alias androiddebugkey
+          echo "DEBUG_KEYSTORE_VERIFIED=$KEYSTORE"
 
       - name: Run debug unit tests
         run: gradle --no-daemon --console=plain :app:testDebugUnitTest
