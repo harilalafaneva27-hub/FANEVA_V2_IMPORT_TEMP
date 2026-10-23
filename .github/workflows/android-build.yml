@@ -1,0 +1,94 @@
+name: FANEVA V2 Android Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: faneva-v2-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Unit tests and Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager "platform-tools" \
+                     "platforms;android-36.1" \
+                     "build-tools;37.0.0"
+
+      - name: Prepare temporary debug keystore
+        shell: bash
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Run debug unit tests
+        run: gradle --no-daemon --console=plain :app:testDebugUnitTest
+
+      - name: Build debug APK
+        id: apk
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          if gradle --no-daemon --console=plain :app:assembleDebug; then
+            if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              sha256sum app/build/outputs/apk/debug/app-debug.apk
+              ls -lh app/build/outputs/apk/debug/app-debug.apk
+            else
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "ERROR: APK not found after build."
+              exit 1
+            fi
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Upload debug APK artifact
+        if: always() && !cancelled() && steps.apk.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: faneva-v2-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
