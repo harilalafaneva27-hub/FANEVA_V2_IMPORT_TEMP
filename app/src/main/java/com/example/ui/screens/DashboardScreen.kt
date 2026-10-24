@@ -37,6 +37,7 @@ import java.util.*
 fun DashboardScreen(
     viewModel: FanevaViewModel,
     onNavigateToPos: () -> Unit,
+    onNavigateToSalesHistory: () -> Unit,
     onNavigateToInventory: () -> Unit,
     onNavigateToTransfers: () -> Unit,
     onNavigateToDebts: () -> Unit,
@@ -169,6 +170,7 @@ fun DashboardScreen(
                             subtitle = "${storeSales.size} transaction(s)",
                             icon = Icons.Default.TrendingUp,
                             accentColor = FanevaEmerald,
+                            onClick = onNavigateToSalesHistory,
                             modifier = Modifier.weight(1f)
                         )
                         MetricCard(

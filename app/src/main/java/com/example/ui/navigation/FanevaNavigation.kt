@@ -78,6 +78,9 @@ fun FanevaApp(
             FanevaScreen.DASHBOARD -> DashboardScreen(
                 viewModel = viewModel,
                 onNavigateToPos = { currentScreen = FanevaScreen.POS },
+                onNavigateToSalesHistory = {
+                    currentScreen = FanevaScreen.SALES_HISTORY
+                },
                 onNavigateToInventory = { currentScreen = FanevaScreen.INVENTORY },
                 onNavigateToTransfers = { currentScreen = FanevaScreen.TRANSFERS },
                 onNavigateToDebts = { currentScreen = FanevaScreen.CUSTOMERS },
