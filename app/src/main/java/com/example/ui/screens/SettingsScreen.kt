@@ -32,7 +32,7 @@ fun SettingsScreen(
     val syncCursor by viewModel.syncCursor.collectAsStateWithLifecycle()
     val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
 
-    var stagingUrlText by remember { mutableStateOf(syncCursor?.stagingApiUrl ?: "https://staging-api.fanevasystem.workers.dev") }
+    var stagingUrlText by remember { mutableStateOf(syncCursor?.stagingApiUrl ?: "") }
     var showResetDialog by remember { mutableStateOf(false) }
     var saveUrlSuccess by remember { mutableStateOf(false) }
 
@@ -81,7 +81,7 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.primary
                         )
                         Text(
-                            text = "Basculez entre les rôles pour tester les permissions et le masquage strict des prix d'achat pour le vendeur.",
+                            text = "Basculez entre les rôles pour tester l'interface. Ces rôles de démonstration ne constituent pas une autorisation de sécurité serveur.",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -234,7 +234,8 @@ fun SettingsScreen(
                         Text("• Vente à crédit : Cohérence atomique stock et compte client", fontSize = 11.sp)
                         Text("• File Outbox : Persistance locale des opérations en attente", fontSize = 11.sp)
                         Text("• Curseur : Aucun avancement sans confirmation serveur (ACK)", fontSize = 11.sp)
-                        Text("• Sécurité : Aucun accès direct à D1, aucune clé privée cliente", fontSize = 11.sp)
+                        Text("• Synchronisation : succès uniquement après réponse HTTP et ACK valides", fontSize = 11.sp)
+                        Text("• Rôles : simulation locale uniquement, sans garantie de sécurité", fontSize = 11.sp)
                     }
                 }
             }

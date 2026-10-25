@@ -78,6 +78,14 @@ abstract class FanevaDatabase : RoomDatabase() {
             val userPrefDao = db.userPreferenceDao()
             val syncCursorDao = db.syncCursorDao()
 
+            // La démo ne peut être créée que dans une base réellement vide.
+            // Cette garde protège les données utilisateur même si cette méthode est rappelée.
+            if (productDao.countAll() > 0 || customerDao.countAll() > 0 ||
+                db.saleDao().countAll() > 0 || db.stockMovementDao().countAll() > 0 ||
+                db.debtPaymentDao().countAll() > 0 || db.pendingSyncDao().countAll() > 0) {
+                return
+            }
+
             // 1. Initial Preferences & Cursor
             userPrefDao.savePreferences(
                 UserPreferenceEntity(
@@ -92,7 +100,7 @@ abstract class FanevaDatabase : RoomDatabase() {
                 SyncCursorEntity(
                     id = 1,
                     lastCursor = 1042L,
-                    stagingApiUrl = "https://staging-api.fanevasystem.workers.dev",
+                    stagingApiUrl = "",
                     isSimulatedOnline = true,
                     lastSyncTimestamp = System.currentTimeMillis() - 15 * 60 * 1000
                 )

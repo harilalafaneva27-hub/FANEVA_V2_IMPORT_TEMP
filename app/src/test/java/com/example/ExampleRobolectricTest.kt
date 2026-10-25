@@ -19,6 +19,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.json.JSONObject
 import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
@@ -323,5 +324,72 @@ class ExampleRobolectricTest {
         // A1 must now be 10 + 15 = 25
         assertEquals(35, database.storeStockDao().getStock(productId, "A2")?.quantity)
         assertEquals(25, database.storeStockDao().getStock(productId, "A1")?.quantity)
+    }
+
+    @Test
+    fun `payment above remaining debt is rejected without debt journal or outbox mutation`() = runBlocking {
+        val customerId = database.customerDao().insertCustomer(
+            CustomerEntity(
+                name = "Client Dette",
+                phone = "0340000000",
+                address = "Antananarivo",
+                creditLimit = 500000.0,
+                currentDebt = 100000.0
+            )
+        )
+        val result = repository.recordDebtPayment(
+            customerId = customerId,
+            amount = 150000.0,
+            paymentMethod = PaymentMethod.ESPECES,
+            note = "Test dépassement",
+            operatorName = "Test",
+            idempotencyKey = "PAYMENT-OVER-100K"
+        )
+        assertTrue(result.isFailure)
+        assertEquals(100000.0, database.customerDao().getCustomerById(customerId)!!.currentDebt, 0.01)
+        assertTrue(database.debtPaymentDao().getAllPaymentsSnapshot().isEmpty())
+        assertTrue(database.pendingSyncDao().getPendingOperationsSnapshot().isEmpty())
+    }
+
+    @Test
+    fun `sale outbox payload is valid JSON and preserves special characters`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-JSON",
+                name = "Produit \"spécial\"",
+                category = "Catégorie",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A1", productId, 2))
+        val result = repository.processSale(
+            storeId = "A1",
+            cartItems = listOf(
+                CartItem(
+                    productId = productId,
+                    productCode = "PRD-JSON",
+                    productName = "Produit \"spécial\"",
+                    unit = "Pcs",
+                    unitPrice = 20.0,
+                    purchasePrice = 10.0,
+                    quantity = 1,
+                    availableInActiveStore = 2
+                )
+            ),
+            saleType = SaleType.CASH,
+            paymentMethod = PaymentMethod.ESPECES,
+            customerId = null,
+            customerName = null,
+            sellerId = "TEST",
+            sellerName = "Opérateur \\ test",
+            paidAmount = 20.0,
+            idempotencyKey = "SALE-JSON-1"
+        )
+        assertTrue(result.isSuccess)
+        val payload = database.pendingSyncDao().getPendingOperationsSnapshot().single().payloadJson
+        val json = JSONObject(payload)
+        assertEquals("A1", json.getString("storeId"))
+        assertEquals("PRD-JSON", json.getJSONArray("items").getJSONObject(0).getString("code"))
     }
 }

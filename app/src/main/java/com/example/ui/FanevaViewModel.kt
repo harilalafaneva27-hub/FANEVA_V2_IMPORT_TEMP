@@ -82,6 +82,8 @@ class FanevaViewModel(
     // POS Cart
     private val _cartItems = MutableStateFlow<List<CartItem>>(emptyList())
     val cartItems: StateFlow<List<CartItem>> = _cartItems.asStateFlow()
+    private val _saleIdempotencyKey = MutableStateFlow<String?>(null)
+    private val _debtPaymentIdempotencyKey = MutableStateFlow<String?>(null)
 
     // Search and filters
     val searchQuery = MutableStateFlow("")
@@ -147,6 +149,7 @@ class FanevaViewModel(
         if (available <= 0) return
 
         _cartItems.update { current ->
+            if (current.isEmpty()) _saleIdempotencyKey.value = null
             val existing = current.find { it.productId == product.id }
             if (existing != null) {
                 if (existing.quantity < available) {
@@ -194,6 +197,7 @@ class FanevaViewModel(
 
     fun clearCart() {
         _cartItems.value = emptyList()
+        _saleIdempotencyKey.value = null
     }
 
     // Process Sale with strict constraints
@@ -206,6 +210,7 @@ class FanevaViewModel(
         onResult: (SaleValidationResult) -> Unit
     ) {
         viewModelScope.launch {
+            val idempotencyKey = _saleIdempotencyKey.value ?: UUID.randomUUID().toString().also { _saleIdempotencyKey.value = it }
             val result = fanevaRepository.processSale(
                 storeId = _activeStoreId.value,
                 cartItems = _cartItems.value,
@@ -216,7 +221,7 @@ class FanevaViewModel(
                 sellerId = "USR-${_currentRole.value.code}",
                 sellerName = _operatorName.value,
                 paidAmount = paidAmount,
-                idempotencyKey = UUID.randomUUID().toString()
+                idempotencyKey = idempotencyKey
             )
             if (result.isSuccess) {
                 clearCart()
@@ -258,13 +263,16 @@ class FanevaViewModel(
         onResult: (Result<String>) -> Unit
     ) {
         viewModelScope.launch {
+            val idempotencyKey = _debtPaymentIdempotencyKey.value ?: UUID.randomUUID().toString().also { _debtPaymentIdempotencyKey.value = it }
             val result = fanevaRepository.recordDebtPayment(
                 customerId = customerId,
                 amount = amount,
                 paymentMethod = method,
                 note = note,
-                operatorName = _operatorName.value
+                operatorName = _operatorName.value,
+                idempotencyKey = idempotencyKey
             )
+            if (result.isSuccess) _debtPaymentIdempotencyKey.value = null
             onResult(result)
         }
     }
@@ -313,6 +321,7 @@ class FanevaViewModel(
             _syncMessage.value = when (result) {
                 is SyncPushResult.Success -> "${result.countSynced} opération(s) synchronisée(s). Curseur mis à jour à ${result.updatedCursor}."
                 is SyncPushResult.Offline -> result.reason
+                is SyncPushResult.ServerNotConfigured -> result.reason
                 is SyncPushResult.PartialError -> "Avertissement : ${result.syncedCount} réussis, ${result.failedCount} échecs : ${result.error}"
             }
             onComplete(result)
