@@ -392,4 +392,21 @@ class ExampleRobolectricTest {
         assertEquals("A1", json.getString("storeId"))
         assertEquals("PRD-JSON", json.getJSONArray("items").getJSONObject(0).getString("code"))
     }
+
+    @Test
+    fun `demo reset refuses to overwrite existing user data`() = runBlocking {
+        database.productDao().insertProduct(
+            ProductEntity(
+                code = "USER-PRODUCT",
+                name = "Produit utilisateur",
+                category = "Test",
+                purchasePrice = 1.0,
+                sellingPrice = 2.0
+            )
+        )
+        val result = repository.resetDatabase()
+        assertTrue(result.isFailure)
+        assertEquals(1, database.productDao().countAll())
+        assertEquals("USER-PRODUCT", database.productDao().getProductByCode("USER-PRODUCT")!!.code)
+    }
 }

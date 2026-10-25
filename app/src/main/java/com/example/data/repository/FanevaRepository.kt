@@ -120,6 +120,12 @@ class FanevaRepository(
                     errorMessage = "Le montant payé est invalide."
                 )
             }
+            if (saleType == SaleType.CREDIT && paidAmount > totalAmount) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Le montant payé ne peut pas dépasser le total de la vente."
+                )
+            }
             val actualPaid = when (saleType) {
                 SaleType.CASH -> totalAmount
                 SaleType.CREDIT -> paidAmount.coerceIn(0.0, totalAmount)
@@ -165,7 +171,9 @@ class FanevaRepository(
                     // Double check invariant
                     throw IllegalStateException("Violation de stock négatif détectée")
                 }
-                stockDao.updateQuantity(item.productId, storeId, newQty)
+                check(stockDao.updateQuantity(item.productId, storeId, newQty) == 1) {
+                    "Stock de vente non mis à jour"
+                }
 
                 // Mouvement de stock traçable
                 movementDao.insertMovement(
