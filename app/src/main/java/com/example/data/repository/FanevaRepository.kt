@@ -7,6 +7,8 @@ import com.example.domain.model.*
 import kotlinx.coroutines.flow.Flow
 import java.text.SimpleDateFormat
 import java.util.*
+import org.json.JSONArray
+import org.json.JSONObject
 
 class FanevaRepository(
     private val database: FanevaDatabase
@@ -78,6 +80,20 @@ class FanevaRepository(
                 )
             }
 
+            // Validation stricte avant toute mutation du stock.
+            if (cartItems.any { item ->
+                    item.quantity <= 0 ||
+                    !item.unitPrice.isFinite() ||
+                    item.unitPrice < 0.0 ||
+                    !item.total.isFinite() ||
+                    item.total < 0.0
+                }) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Quantité ou prix invalide. La vente est annulée."
+                )
+            }
+
             // 2. Vérification stricte des stocks disponibles dans le magasin actif
             for (item in cartItems) {
                 val currentStock = stockDao.getStock(item.productId, storeId)?.quantity ?: 0
@@ -91,6 +107,19 @@ class FanevaRepository(
 
             // Calculs financiers
             val totalAmount = cartItems.sumOf { it.total }
+            if (!totalAmount.isFinite() || totalAmount < 0.0) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Montant total invalide. La vente est annulée."
+                )
+            }
+            if (saleType == SaleType.CREDIT &&
+                (!paidAmount.isFinite() || paidAmount < 0.0)) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Le montant payé est invalide."
+                )
+            }
             val actualPaid = when (saleType) {
                 SaleType.CASH -> totalAmount
                 SaleType.CREDIT -> paidAmount.coerceIn(0.0, totalAmount)
@@ -192,23 +221,30 @@ class FanevaRepository(
             saleDao.insertSaleItems(itemsEntities)
 
             // 5. Persistance locale Outbox pour future synchronisation Cloudflare Workers
-            val itemsSummary = cartItems.map { mapOf("code" to it.productCode, "qty" to it.quantity, "price" to it.unitPrice) }
-            val payload = """
-                {
-                    "saleId": "$saleId",
-                    "saleNumber": "$saleNumber",
-                    "storeId": "$storeId",
-                    "saleType": "${saleType.name}",
-                    "totalAmount": $totalAmount,
-                    "paidAmount": $actualPaid,
-                    "remainingAmount": $remaining,
-                    "paymentMethod": "${paymentMethod.name}",
-                    "customerId": $customerId,
-                    "idempotencyKey": "$idempotencyKey",
-                    "items": $itemsSummary,
-                    "timestamp": ${System.currentTimeMillis()}
-                }
-            """.trimIndent()
+            val itemsJson = JSONArray()
+            cartItems.forEach { item ->
+                itemsJson.put(
+                    JSONObject()
+                        .put("code", item.productCode)
+                        .put("qty", item.quantity)
+                        .put("price", item.unitPrice)
+                )
+            }
+
+            val payload = JSONObject()
+                .put("saleId", saleId)
+                .put("saleNumber", saleNumber)
+                .put("storeId", storeId)
+                .put("saleType", saleType.name)
+                .put("totalAmount", totalAmount)
+                .put("paidAmount", actualPaid)
+                .put("remainingAmount", remaining)
+                .put("paymentMethod", paymentMethod.name)
+                .put("customerId", customerId ?: JSONObject.NULL)
+                .put("idempotencyKey", idempotencyKey)
+                .put("items", itemsJson)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
 
             pendingSyncDao.insertOperation(
                 PendingSyncOperationEntity(
@@ -258,12 +294,24 @@ class FanevaRepository(
             }
 
             val toStock = stockDao.getStock(productId, toStoreId)?.quantity ?: 0
+            if (toStock > Int.MAX_VALUE - quantity) {
+                return@withTransaction TransferValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Dépassement de capacité du stock destination."
+                )
+            }
 
             // Mise à jour des stocks
             val newFromQty = fromStock - quantity
             val newToQty = toStock + quantity
             stockDao.updateQuantity(productId, fromStoreId, newFromQty)
-            stockDao.updateQuantity(productId, toStoreId, newToQty)
+            stockDao.insertOrUpdateStock(
+                StoreStockEntity(
+                    storeId = toStoreId,
+                    productId = productId,
+                    quantity = newToQty
+                )
+            )
 
             val transferId = UUID.randomUUID().toString()
             val mvtNumber = "TRF-${UUID.randomUUID().toString().take(8).uppercase()}"
@@ -284,19 +332,16 @@ class FanevaRepository(
                 )
             )
 
-            // Outbox
-            val payload = """
-                {
-                    "transferId": "$transferId",
-                    "movementNumber": "$mvtNumber",
-                    "productId": $productId,
-                    "fromStoreId": "$fromStoreId",
-                    "toStoreId": "$toStoreId",
-                    "quantity": $quantity,
-                    "operator": "$operatorName",
-                    "timestamp": ${System.currentTimeMillis()}
-                }
-            """.trimIndent()
+            val payload = JSONObject()
+                .put("transferId", transferId)
+                .put("movementNumber", mvtNumber)
+                .put("productId", productId)
+                .put("fromStoreId", fromStoreId)
+                .put("toStoreId", toStoreId)
+                .put("quantity", quantity)
+                .put("operator", operatorName)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
 
             pendingSyncDao.insertOperation(
                 PendingSyncOperationEntity(
