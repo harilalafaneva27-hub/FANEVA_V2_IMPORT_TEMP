@@ -12,6 +12,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.example.data.local.FanevaDatabase
+import com.example.data.repository.AuthRepository
 import com.example.data.repository.FanevaRepository
 import com.example.data.repository.SyncRepositoryImpl
 import com.example.ui.FanevaViewModel
@@ -27,7 +28,8 @@ class MainActivity : ComponentActivity() {
                 val database = FanevaDatabase.getDatabase(applicationContext, lifecycleScope)
                 val fanevaRepository = FanevaRepository(database)
                 val syncRepository = SyncRepositoryImpl(database.pendingSyncDao(), database.syncCursorDao())
-                return FanevaViewModel(fanevaRepository, syncRepository) as T
+                val authRepository = AuthRepository(database.authDao())
+                return FanevaViewModel(fanevaRepository, syncRepository, authRepository) as T
             }
         }
     }
