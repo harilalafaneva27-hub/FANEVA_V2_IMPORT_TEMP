@@ -44,12 +44,29 @@ jobs:
                      "platforms;android-36.1" \
                      "build-tools;36.0.0"
 
-      - name: Prepare temporary debug keystore
+      - name: Prepare persistent or temporary debug keystore
         shell: bash
+        env:
+          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          ANDROID_DEBUG_STORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_STORE_PASSWORD }}
+          ANDROID_DEBUG_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
+          ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
-          if [ ! -f "$KEYSTORE" ]; then
+          if [ -n "${ANDROID_DEBUG_KEYSTORE_BASE64:-}" ] && \
+             [ -n "${ANDROID_DEBUG_STORE_PASSWORD:-}" ] && \
+             [ -n "${ANDROID_DEBUG_KEY_ALIAS:-}" ] && \
+             [ -n "${ANDROID_DEBUG_KEY_PASSWORD:-}" ]; then
+            printf '%s' "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+            {
+              echo "DEBUG_KEYSTORE_PATH=$KEYSTORE"
+              echo "DEBUG_STORE_PASSWORD=$ANDROID_DEBUG_STORE_PASSWORD"
+              echo "DEBUG_KEY_ALIAS=$ANDROID_DEBUG_KEY_ALIAS"
+              echo "DEBUG_KEY_PASSWORD=$ANDROID_DEBUG_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "Using persistent debug keystore from GitHub Actions Secrets."
+          else
             keytool -genkeypair -v \
               -keystore "$KEYSTORE" \
               -storepass android \
@@ -59,10 +76,17 @@ jobs:
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
+            {
+              echo "DEBUG_KEYSTORE_PATH=$KEYSTORE"
+              echo "DEBUG_STORE_PASSWORD=android"
+              echo "DEBUG_KEY_ALIAS=androiddebugkey"
+              echo "DEBUG_KEY_PASSWORD=android"
+            } >> "$GITHUB_ENV"
+            echo "Persistent signing secrets are not configured; using a temporary debug keystore."
           fi
           test -s "$KEYSTORE"
           keytool -list -keystore "$KEYSTORE" \
-            -storepass android -alias androiddebugkey
+            -storepass "${DEBUG_STORE_PASSWORD}" -alias "${DEBUG_KEY_ALIAS}"
           echo "DEBUG_KEYSTORE_VERIFIED=$KEYSTORE"
 
       - name: Run debug unit tests

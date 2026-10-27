@@ -25,16 +25,22 @@ import com.example.ui.theme.*
 @Composable
 fun SettingsScreen(
     viewModel: FanevaViewModel,
+    onLogout: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val currentRole by viewModel.currentRole.collectAsStateWithLifecycle()
     val activeStoreId by viewModel.activeStoreId.collectAsStateWithLifecycle()
     val syncCursor by viewModel.syncCursor.collectAsStateWithLifecycle()
     val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
+    val sellerAccounts by viewModel.sellerAccounts.collectAsStateWithLifecycle()
 
     var stagingUrlText by remember { mutableStateOf(syncCursor?.stagingApiUrl ?: "") }
     var showResetDialog by remember { mutableStateOf(false) }
     var saveUrlSuccess by remember { mutableStateOf(false) }
+    var sellerUsername by remember { mutableStateOf("") }
+    var sellerDisplayName by remember { mutableStateOf("") }
+    var sellerPassword by remember { mutableStateOf("") }
+    var sellerMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(syncCursor?.stagingApiUrl) {
         syncCursor?.stagingApiUrl?.let { stagingUrlText = it }
@@ -65,66 +71,47 @@ fun SettingsScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // 1. Demo Role Switcher
+            // 1. Authenticated profile
             item {
-                Card(
-                    shape = RoundedCornerShape(14.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(
-                            text = "Profil Utilisateur de Démonstration",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            text = "Basculez entre les rôles pour tester l'interface. Ces rôles de démonstration ne constituent pas une autorisation de sécurité serveur.",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Session authentifiée", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(currentRole.title, fontWeight = FontWeight.SemiBold)
+                            RoleBadge(role = currentRole)
+                        }
+                        Text("Les préférences locales ne constituent pas une preuve d'identité.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = onLogout, modifier = Modifier.testTag("logout_button")) { Text("Se déconnecter") }
+                    }
+                }
+            }
 
-                        UserRole.entries.forEach { role ->
-                            val isSelected = currentRole == role
-                            Card(
-                                shape = RoundedCornerShape(10.dp),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { viewModel.switchRole(role) }
-                                    .testTag("switch_role_${role.code}")
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(role.title, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                            RoleBadge(role = role)
-                                        }
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        Text(role.description, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    RadioButton(
-                                        selected = isSelected,
-                                        onClick = { viewModel.switchRole(role) }
-                                    )
+            // 2. Admin-only seller management
+            if (viewModel.isAdminAuthenticated()) {
+                item {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Gestion des vendeurs", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            Text("Les mots de passe ne sont jamais affichés.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            OutlinedTextField(sellerUsername, { sellerUsername = it; sellerMessage = null }, label = { Text("Identifiant unique") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("seller_create_username"))
+                            OutlinedTextField(sellerDisplayName, { sellerDisplayName = it; sellerMessage = null }, label = { Text("Nom affiché") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("seller_create_name"))
+                            OutlinedTextField(sellerPassword, { sellerPassword = it; sellerMessage = null }, label = { Text("Mot de passe") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("seller_create_password"))
+                            Button(onClick = {
+                                viewModel.createSeller(sellerUsername, sellerDisplayName, sellerPassword) { message ->
+                                    sellerMessage = message ?: "Compte vendeur créé."
+                                    if (message == null) { sellerUsername = ""; sellerDisplayName = ""; sellerPassword = "" }
                                 }
+                            }, modifier = Modifier.fillMaxWidth().testTag("seller_create_button")) { Text("Créer le compte vendeur") }
+                            sellerMessage?.let { Text(it, color = if (it.startsWith("Compte")) FanevaEmeraldDark else MaterialTheme.colorScheme.error, fontSize = 12.sp) }
+                            sellerAccounts.forEach { seller ->
+                                Text("• ${seller.username} — ${seller.displayName}", fontSize = 13.sp)
                             }
                         }
                     }
                 }
             }
 
-            // 2. Default Store Selector
+            // 3. Default Store Selector
             item {
                 Card(
                     shape = RoundedCornerShape(14.dp),

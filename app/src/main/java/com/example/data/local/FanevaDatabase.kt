@@ -23,9 +23,10 @@ import java.util.UUID
         DebtPaymentEntity::class,
         PendingSyncOperationEntity::class,
         SyncCursorEntity::class,
-        UserPreferenceEntity::class
+        UserPreferenceEntity::class,
+        AuthAccountEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class FanevaDatabase : RoomDatabase() {
@@ -39,6 +40,7 @@ abstract class FanevaDatabase : RoomDatabase() {
     abstract fun pendingSyncDao(): PendingSyncDao
     abstract fun syncCursorDao(): SyncCursorDao
     abstract fun userPreferenceDao(): UserPreferenceDao
+    abstract fun authDao(): AuthDao
 
     companion object {
         @Volatile
@@ -51,10 +53,30 @@ abstract class FanevaDatabase : RoomDatabase() {
                     FanevaDatabase::class.java,
                     "faneva_v2_db"
                 )
+                    .addMigrations(MIGRATION_1_2)
                     .addCallback(FanevaDatabaseCallback(scope))
                     .build()
                 INSTANCE = instance
                 instance
+            }
+        }
+
+        val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS auth_accounts (
+                        id TEXT NOT NULL,
+                        username TEXT NOT NULL,
+                        displayName TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        passwordSalt TEXT NOT NULL,
+                        passwordHash TEXT NOT NULL,
+                        isActive INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL,
+                        PRIMARY KEY(id)
+                    )""".trimIndent()
+                )
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_auth_accounts_username ON auth_accounts(username)")
             }
         }
 

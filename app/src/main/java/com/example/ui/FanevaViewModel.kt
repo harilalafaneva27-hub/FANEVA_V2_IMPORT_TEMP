@@ -3,6 +3,8 @@ package com.example.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.entity.*
+import com.example.data.repository.AuthRepository
+import com.example.data.repository.AuthResult
 import com.example.data.repository.FanevaRepository
 import com.example.data.repository.SyncPushResult
 import com.example.data.repository.SyncRepository
@@ -10,6 +12,12 @@ import com.example.domain.model.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
+
+sealed interface AuthUiState {
+    data object Loading : AuthUiState
+    data object SignedOut : AuthUiState
+    data class SignedIn(val session: UserSession) : AuthUiState
+}
 
 data class ProductWithStock(
     val product: ProductEntity,
@@ -19,8 +27,15 @@ data class ProductWithStock(
 
 class FanevaViewModel(
     private val fanevaRepository: FanevaRepository,
-    private val syncRepository: SyncRepository
+    private val syncRepository: SyncRepository,
+    private val authRepository: AuthRepository
 ) : ViewModel() {
+
+    private val _authState = MutableStateFlow<AuthUiState>(AuthUiState.Loading)
+    val authState: StateFlow<AuthUiState> = _authState.asStateFlow()
+
+    val sellerAccounts: StateFlow<List<SellerAccountSummary>> = authRepository.sellers
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // User preferences & role
     private val _currentRole = MutableStateFlow(UserRole.ADMIN)
@@ -97,35 +112,78 @@ class FanevaViewModel(
     val syncMessage: StateFlow<String?> = _syncMessage.asStateFlow()
 
     init {
-        // Observe stored preferences
+        viewModelScope.launch {
+            authRepository.ensureInitialAdmin()
+            _authState.value = AuthUiState.SignedOut
+        }
+        // Preferences are convenience settings only, never authentication evidence.
         viewModelScope.launch {
             fanevaRepository.userPreferences.collect { pref ->
                 if (pref != null) {
-                    val role = when (pref.activeRole) {
-                        "GERANT" -> UserRole.GERANT
-                        "VENDEUR" -> UserRole.VENDEUR
-                        else -> UserRole.ADMIN
-                    }
-                    _currentRole.value = role
                     _activeStoreId.value = pref.activeStoreId
-                    _operatorName.value = pref.operatorName
                 }
             }
         }
     }
 
+    fun authenticateAdmin(code: String, onResult: (String?) -> Unit) {
+        viewModelScope.launch {
+            when (val result = authRepository.authenticateAdmin(code.toCharArray())) {
+                is AuthResult.Success -> {
+                    applySession(result.session)
+                    onResult(null)
+                }
+                is AuthResult.Failure -> onResult(result.message)
+            }
+        }
+    }
+
+    fun authenticateSeller(username: String, password: String, onResult: (String?) -> Unit) {
+        viewModelScope.launch {
+            when (val result = authRepository.authenticateSeller(username, password.toCharArray())) {
+                is AuthResult.Success -> {
+                    applySession(result.session)
+                    onResult(null)
+                }
+                is AuthResult.Failure -> onResult(result.message)
+            }
+        }
+    }
+
+    fun logout() {
+        _authState.value = AuthUiState.SignedOut
+        _currentRole.value = UserRole.VENDEUR
+        _operatorName.value = ""
+    }
+
+    fun createSeller(username: String, displayName: String, password: String, onResult: (String?) -> Unit) {
+        if (!isAdminAuthenticated()) {
+            onResult("Action réservée à une session Admin authentifiée")
+            return
+        }
+        viewModelScope.launch {
+            val result = authRepository.createSeller(username, displayName, password.toCharArray())
+            onResult(result.exceptionOrNull()?.message)
+        }
+    }
+
+    private fun applySession(session: UserSession) {
+        _authState.value = AuthUiState.SignedIn(session)
+        _currentRole.value = session.role
+        _activeStoreId.value = session.defaultStoreId
+        _operatorName.value = session.name
+        viewModelScope.launch {
+            fanevaRepository.updateUserPreference(session.role.code, session.defaultStoreId, session.name)
+        }
+    }
+
+    fun isAdminAuthenticated(): Boolean =
+        (_authState.value as? AuthUiState.SignedIn)?.session?.role == UserRole.ADMIN
+
     // Role switcher
     fun switchRole(role: UserRole) {
-        _currentRole.value = role
-        val name = when (role) {
-            UserRole.ADMIN -> "Harilala R. (Admin)"
-            UserRole.GERANT -> "Mamy T. (Gérant A1-A5)"
-            UserRole.VENDEUR -> "Soa K. (Vendeuse)"
-        }
-        _operatorName.value = name
-        viewModelScope.launch {
-            fanevaRepository.updateUserPreference(role.code, _activeStoreId.value, name)
-        }
+        // Les rôles de démonstration ne peuvent plus modifier une session authentifiée.
+        if (isAdminAuthenticated() && role == UserRole.ADMIN) return
     }
 
     // Active store switcher (A1..A5)
