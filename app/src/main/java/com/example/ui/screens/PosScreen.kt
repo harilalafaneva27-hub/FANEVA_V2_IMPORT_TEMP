@@ -30,6 +30,7 @@ import com.example.domain.model.SaleType
 import com.example.domain.model.SaleValidationResult
 import com.example.domain.model.StoreId
 import com.example.ui.FanevaViewModel
+import com.example.ui.ProductWithStock
 import com.example.ui.components.RoleBadge
 import com.example.ui.components.StoreSelectorChipRow
 import com.example.ui.theme.*
@@ -51,6 +52,8 @@ fun PosScreen(
     var selectedCategory by remember { mutableStateOf<String?>(null) }
     var showCheckoutDialog by remember { mutableStateOf(false) }
     var showCartSheet by remember { mutableStateOf(false) }
+    var selectedProductForQuantity by remember { mutableStateOf<ProductWithStock?>(null) }
+    var quantityToAdd by remember { mutableStateOf(1) }
     var lastSaleSuccess by remember { mutableStateOf<SaleValidationResult?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -295,7 +298,10 @@ fun PosScreen(
                             // Add / Adjust in Cart
                             if (quantityInCart == 0) {
                                 Button(
-                                    onClick = { viewModel.addToCart(item.product) },
+                                    onClick = {
+                                        selectedProductForQuantity = item
+                                        quantityToAdd = 1
+                                    },
                                     enabled = !isOutOfStock,
                                     shape = RoundedCornerShape(8.dp),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
@@ -336,6 +342,73 @@ fun PosScreen(
                 }
             }
         }
+    }
+
+    // Sélection de quantité avant ajout au panier
+    selectedProductForQuantity?.let { selected ->
+        val maxAvailable = selected.activeStoreQuantity
+        AlertDialog(
+            onDismissRequest = { selectedProductForQuantity = null },
+            title = { Text("Choisir la quantité") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(selected.product.name, fontWeight = FontWeight.SemiBold)
+                    Text("Stock disponible : $maxAvailable ${selected.product.unit}")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = {
+                                quantityToAdd = (quantityToAdd - 1).coerceAtLeast(1)
+                            },
+                            enabled = quantityToAdd > 1,
+                            modifier = Modifier.testTag("quantity_decrease")
+                        ) {
+                            Icon(Icons.Default.Remove, contentDescription = "Diminuer")
+                        }
+                        Text(
+                            text = quantityToAdd.toString(),
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .padding(horizontal = 24.dp)
+                                .testTag("selected_quantity")
+                        )
+                        IconButton(
+                            onClick = {
+                                quantityToAdd = (quantityToAdd + 1).coerceAtMost(maxAvailable)
+                            },
+                            enabled = quantityToAdd < maxAvailable,
+                            modifier = Modifier.testTag("quantity_increase")
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = "Augmenter")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.addToCart(selected.product, quantityToAdd)
+                        selectedProductForQuantity = null
+                    },
+                    enabled = maxAvailable > 0 && quantityToAdd in 1..maxAvailable,
+                    modifier = Modifier.testTag("confirm_add_quantity")
+                ) {
+                    Text("Ajouter au panier")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { selectedProductForQuantity = null },
+                    modifier = Modifier.testTag("cancel_quantity")
+                ) {
+                    Text("Annuler")
+                }
+            }
+        )
     }
 
     // Cart Details Dialog
@@ -382,8 +455,11 @@ fun PosScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showCartSheet = false }) {
-                    Text("Fermer")
+                TextButton(
+                    onClick = { showCartSheet = false },
+                    modifier = Modifier.testTag("return_to_products_from_cart")
+                ) {
+                    Text("Retour aux produits")
                 }
             }
         )
@@ -583,8 +659,12 @@ fun PosScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showCheckoutDialog = false }, enabled = !isProcessing) {
-                    Text("Annuler")
+                TextButton(
+                    onClick = { showCheckoutDialog = false },
+                    enabled = !isProcessing,
+                    modifier = Modifier.testTag("return_to_products_from_checkout")
+                ) {
+                    Text("Retour aux produits")
                 }
             }
         )
