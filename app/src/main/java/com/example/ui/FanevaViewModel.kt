@@ -202,20 +202,31 @@ class FanevaViewModel(
     }
 
     // Cart operations
-    fun addToCart(product: ProductEntity) {
-        val available = productsWithStock.value.find { it.product.id == product.id }?.activeStoreQuantity ?: 0
+    fun addToCart(product: ProductEntity, requestedQuantity: Int = 1) {
+        if (requestedQuantity <= 0) return
+
+        val available = productsWithStock.value
+            .find { it.product.id == product.id }
+            ?.activeStoreQuantity ?: 0
         if (available <= 0) return
 
         _cartItems.update { current ->
             if (current.isEmpty()) _saleIdempotencyKey.value = null
+
             val existing = current.find { it.productId == product.id }
             if (existing != null) {
-                if (existing.quantity < available) {
-                    current.map {
-                        if (it.productId == product.id) it.copy(quantity = it.quantity + 1) else it
+                val cappedQuantity = (existing.quantity + requestedQuantity)
+                    .coerceAtMost(available)
+
+                current.map { item ->
+                    if (item.productId == product.id) {
+                        item.copy(
+                            quantity = cappedQuantity,
+                            availableInActiveStore = available
+                        )
+                    } else {
+                        item
                     }
-                } else {
-                    current // Cannot exceed available stock
                 }
             } else {
                 current + CartItem(
@@ -225,7 +236,7 @@ class FanevaViewModel(
                     unit = product.unit,
                     unitPrice = product.sellingPrice,
                     purchasePrice = product.purchasePrice,
-                    quantity = 1,
+                    quantity = requestedQuantity.coerceAtMost(available),
                     availableInActiveStore = available
                 )
             }
