@@ -7,6 +7,8 @@ import com.example.domain.model.*
 import kotlinx.coroutines.flow.Flow
 import java.text.SimpleDateFormat
 import java.util.*
+import org.json.JSONArray
+import org.json.JSONObject
 
 class FanevaRepository(
     private val database: FanevaDatabase
@@ -78,6 +80,20 @@ class FanevaRepository(
                 )
             }
 
+            // Validation stricte avant toute mutation du stock.
+            if (cartItems.any { item ->
+                    item.quantity <= 0 ||
+                    !item.unitPrice.isFinite() ||
+                    item.unitPrice < 0.0 ||
+                    !item.total.isFinite() ||
+                    item.total < 0.0
+                }) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Quantité ou prix invalide. La vente est annulée."
+                )
+            }
+
             // 2. Vérification stricte des stocks disponibles dans le magasin actif
             for (item in cartItems) {
                 val currentStock = stockDao.getStock(item.productId, storeId)?.quantity ?: 0
@@ -91,6 +107,25 @@ class FanevaRepository(
 
             // Calculs financiers
             val totalAmount = cartItems.sumOf { it.total }
+            if (!totalAmount.isFinite() || totalAmount < 0.0) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Montant total invalide. La vente est annulée."
+                )
+            }
+            if (saleType == SaleType.CREDIT &&
+                (!paidAmount.isFinite() || paidAmount < 0.0)) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Le montant payé est invalide."
+                )
+            }
+            if (saleType == SaleType.CREDIT && paidAmount > totalAmount) {
+                return@withTransaction SaleValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Le montant payé ne peut pas dépasser le total de la vente."
+                )
+            }
             val actualPaid = when (saleType) {
                 SaleType.CASH -> totalAmount
                 SaleType.CREDIT -> paidAmount.coerceIn(0.0, totalAmount)
@@ -136,7 +171,9 @@ class FanevaRepository(
                     // Double check invariant
                     throw IllegalStateException("Violation de stock négatif détectée")
                 }
-                stockDao.updateQuantity(item.productId, storeId, newQty)
+                check(stockDao.updateQuantity(item.productId, storeId, newQty) == 1) {
+                    "Stock de vente non mis à jour"
+                }
 
                 // Mouvement de stock traçable
                 movementDao.insertMovement(
@@ -192,23 +229,30 @@ class FanevaRepository(
             saleDao.insertSaleItems(itemsEntities)
 
             // 5. Persistance locale Outbox pour future synchronisation Cloudflare Workers
-            val itemsSummary = cartItems.map { mapOf("code" to it.productCode, "qty" to it.quantity, "price" to it.unitPrice) }
-            val payload = """
-                {
-                    "saleId": "$saleId",
-                    "saleNumber": "$saleNumber",
-                    "storeId": "$storeId",
-                    "saleType": "${saleType.name}",
-                    "totalAmount": $totalAmount,
-                    "paidAmount": $actualPaid,
-                    "remainingAmount": $remaining,
-                    "paymentMethod": "${paymentMethod.name}",
-                    "customerId": $customerId,
-                    "idempotencyKey": "$idempotencyKey",
-                    "items": $itemsSummary,
-                    "timestamp": ${System.currentTimeMillis()}
-                }
-            """.trimIndent()
+            val itemsJson = JSONArray()
+            cartItems.forEach { item ->
+                itemsJson.put(
+                    JSONObject()
+                        .put("code", item.productCode)
+                        .put("qty", item.quantity)
+                        .put("price", item.unitPrice)
+                )
+            }
+
+            val payload = JSONObject()
+                .put("saleId", saleId)
+                .put("saleNumber", saleNumber)
+                .put("storeId", storeId)
+                .put("saleType", saleType.name)
+                .put("totalAmount", totalAmount)
+                .put("paidAmount", actualPaid)
+                .put("remainingAmount", remaining)
+                .put("paymentMethod", paymentMethod.name)
+                .put("customerId", customerId ?: JSONObject.NULL)
+                .put("idempotencyKey", idempotencyKey)
+                .put("items", itemsJson)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
 
             pendingSyncDao.insertOperation(
                 PendingSyncOperationEntity(
@@ -239,7 +283,8 @@ class FanevaRepository(
         toStoreId: String,
         quantity: Int,
         operatorName: String,
-        reason: String
+        reason: String,
+        idempotencyKey: String = UUID.randomUUID().toString()
     ): TransferValidationResult {
         if (fromStoreId == toStoreId) {
             return TransferValidationResult(isSuccess = false, errorMessage = "Le magasin d'origine et de destination doivent être distincts")
@@ -249,7 +294,21 @@ class FanevaRepository(
         }
 
         return database.withTransaction {
-            val fromStock = stockDao.getStock(productId, fromStoreId)?.quantity ?: 0
+            if (pendingSyncDao.getByIdempotencyKey(idempotencyKey) != null) {
+                return@withTransaction TransferValidationResult(isSuccess = true, transferId = idempotencyKey)
+            }
+            if (StoreId.entries.none { it.code == fromStoreId } || StoreId.entries.none { it.code == toStoreId }) {
+                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Magasin source ou destinataire inconnu")
+            }
+            if (productDao.getProductById(productId) == null) {
+                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Produit introuvable")
+            }
+            val fromStockEntity = stockDao.getStock(productId, fromStoreId)
+            val toStockEntity = stockDao.getStock(productId, toStoreId)
+            if (fromStockEntity == null || toStockEntity == null) {
+                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Stock source ou destination introuvable")
+            }
+            val fromStock = fromStockEntity.quantity
             if (fromStock < quantity) {
                 return@withTransaction TransferValidationResult(
                     isSuccess = false,
@@ -257,15 +316,21 @@ class FanevaRepository(
                 )
             }
 
-            val toStock = stockDao.getStock(productId, toStoreId)?.quantity ?: 0
+            val toStock = toStockEntity.quantity
+            if (toStock > Int.MAX_VALUE - quantity) {
+                return@withTransaction TransferValidationResult(
+                    isSuccess = false,
+                    errorMessage = "Dépassement de capacité du stock destination."
+                )
+            }
 
             // Mise à jour des stocks
             val newFromQty = fromStock - quantity
             val newToQty = toStock + quantity
-            stockDao.updateQuantity(productId, fromStoreId, newFromQty)
-            stockDao.updateQuantity(productId, toStoreId, newToQty)
+            check(stockDao.updateQuantity(productId, fromStoreId, newFromQty) == 1) { "Stock source non mis à jour" }
+            check(stockDao.updateQuantity(productId, toStoreId, newToQty) == 1) { "Stock destination non mis à jour" }
 
-            val transferId = UUID.randomUUID().toString()
+            val transferId = idempotencyKey
             val mvtNumber = "TRF-${UUID.randomUUID().toString().take(8).uppercase()}"
 
             movementDao.insertMovement(
@@ -284,19 +349,17 @@ class FanevaRepository(
                 )
             )
 
-            // Outbox
-            val payload = """
-                {
-                    "transferId": "$transferId",
-                    "movementNumber": "$mvtNumber",
-                    "productId": $productId,
-                    "fromStoreId": "$fromStoreId",
-                    "toStoreId": "$toStoreId",
-                    "quantity": $quantity,
-                    "operator": "$operatorName",
-                    "timestamp": ${System.currentTimeMillis()}
-                }
-            """.trimIndent()
+            val payload = JSONObject()
+                .put("transferId", transferId)
+                .put("movementNumber", mvtNumber)
+                .put("productId", productId)
+                .put("fromStoreId", fromStoreId)
+                .put("toStoreId", toStoreId)
+                .put("quantity", quantity)
+                .put("operator", operatorName)
+                .put("idempotencyKey", idempotencyKey)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
 
             pendingSyncDao.insertOperation(
                 PendingSyncOperationEntity(
@@ -321,19 +384,30 @@ class FanevaRepository(
         amount: Double,
         paymentMethod: PaymentMethod,
         note: String,
-        operatorName: String
+        operatorName: String,
+        idempotencyKey: String = UUID.randomUUID().toString()
     ): Result<String> {
-        if (amount <= 0) return Result.failure(IllegalArgumentException("Le montant du règlement doit être supérieur à zéro"))
+        if (!amount.isFinite() || amount <= 0) {
+            return Result.failure(IllegalArgumentException("Le montant du règlement doit être fini et supérieur à zéro"))
+        }
 
         return database.withTransaction {
             val customer = customerDao.getCustomerById(customerId)
                 ?: return@withTransaction Result.failure(IllegalArgumentException("Client introuvable"))
+            val existingPayment = debtPaymentDao.getPaymentByIdempotencyKey(idempotencyKey)
+            if (existingPayment != null) return@withTransaction Result.success(existingPayment.receiptNumber)
+            if (amount > customer.currentDebt) {
+                return@withTransaction Result.failure(
+                    IllegalArgumentException("Le paiement ne peut pas dépasser le solde restant de la dette")
+                )
+            }
 
-            val newDebt = (customer.currentDebt - amount).coerceAtLeast(0.0)
+            val newDebt = customer.currentDebt - amount
+            check(newDebt >= 0.0) { "Le solde de dette ne peut pas être négatif" }
             customerDao.updateDebt(customerId, newDebt)
 
             val receiptNumber = "REC-${System.currentTimeMillis().toString().takeLast(6)}"
-            val paymentId = UUID.randomUUID().toString()
+            val paymentId = idempotencyKey
 
             val paymentEntity = DebtPaymentEntity(
                 id = paymentId,
@@ -347,18 +421,17 @@ class FanevaRepository(
             )
             debtPaymentDao.insertPayment(paymentEntity)
 
-            val payload = """
-                {
-                    "paymentId": "$paymentId",
-                    "receiptNumber": "$receiptNumber",
-                    "customerId": $customerId,
-                    "amountPaid": $amount,
-                    "newDebt": $newDebt,
-                    "paymentMethod": "${paymentMethod.name}",
-                    "operator": "$operatorName",
-                    "timestamp": ${System.currentTimeMillis()}
-                }
-            """.trimIndent()
+            val payload = JSONObject()
+                .put("paymentId", paymentId)
+                .put("receiptNumber", receiptNumber)
+                .put("customerId", customerId)
+                .put("amountPaid", amount)
+                .put("newDebt", newDebt)
+                .put("paymentMethod", paymentMethod.name)
+                .put("operator", operatorName)
+                .put("idempotencyKey", idempotencyKey)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
 
             pendingSyncDao.insertOperation(
                 PendingSyncOperationEntity(
@@ -381,37 +454,37 @@ class FanevaRepository(
         address: String,
         creditLimit: Double
     ): Long {
-        val customer = CustomerEntity(
-            name = name,
-            phone = phone,
-            address = address,
-            creditLimit = creditLimit,
-            currentDebt = 0.0
-        )
-        val id = customerDao.insertCustomer(customer)
-
-        val payload = """
-            {
-                "customerId": $id,
-                "name": "$name",
-                "phone": "$phone",
-                "address": "$address",
-                "creditLimit": $creditLimit,
-                "timestamp": ${System.currentTimeMillis()}
-            }
-        """.trimIndent()
-
-        pendingSyncDao.insertOperation(
-            PendingSyncOperationEntity(
-                mutationId = UUID.randomUUID().toString(),
-                entityType = "CUSTOMER",
-                action = "CREATE",
-                payloadJson = payload,
-                idempotencyKey = "CUST-$id",
-                status = "PENDING"
+        require(creditLimit.isFinite() && creditLimit >= 0.0) { "Plafond de crédit invalide" }
+        return database.withTransaction {
+            val id = customerDao.insertCustomer(
+                CustomerEntity(
+                    name = name,
+                    phone = phone,
+                    address = address,
+                    creditLimit = creditLimit,
+                    currentDebt = 0.0
+                )
             )
-        )
-        return id
+            val payload = JSONObject()
+                .put("customerId", id)
+                .put("name", name)
+                .put("phone", phone)
+                .put("address", address)
+                .put("creditLimit", creditLimit)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
+            pendingSyncDao.insertOperation(
+                PendingSyncOperationEntity(
+                    mutationId = UUID.randomUUID().toString(),
+                    entityType = "CUSTOMER",
+                    action = "CREATE",
+                    payloadJson = payload,
+                    idempotencyKey = "CUST-$id",
+                    status = "PENDING"
+                )
+            )
+            id
+        }
     }
 
     suspend fun addNewProduct(
@@ -424,51 +497,46 @@ class FanevaRepository(
         unit: String,
         initialStoreStocks: Map<String, Int>
     ): Long {
-        val product = ProductEntity(
-            code = code,
-            name = name,
-            category = category,
-            purchasePrice = purchasePrice,
-            sellingPrice = sellingPrice,
-            minStockAlert = minAlert,
-            unit = unit
-        )
-        val productId = productDao.insertProduct(product)
-
-        // Initial stock in each store
-        StoreId.entries.forEach { store ->
-            val qty = initialStoreStocks[store.code] ?: 0
-            stockDao.insertOrUpdateStock(
-                StoreStockEntity(
-                    storeId = store.code,
-                    productId = productId,
-                    quantity = qty.coerceAtLeast(0)
+        require(purchasePrice.isFinite() && purchasePrice >= 0.0) { "Prix d'achat invalide" }
+        require(sellingPrice.isFinite() && sellingPrice >= 0.0) { "Prix de vente invalide" }
+        require(minAlert >= 0 && initialStoreStocks.values.all { it >= 0 }) { "Stock initial invalide" }
+        return database.withTransaction {
+            val productId = productDao.insertProduct(
+                ProductEntity(
+                    code = code,
+                    name = name,
+                    category = category,
+                    purchasePrice = purchasePrice,
+                    sellingPrice = sellingPrice,
+                    minStockAlert = minAlert,
+                    unit = unit
                 )
             )
-        }
-
-        val payload = """
-            {
-                "productId": $productId,
-                "code": "$code",
-                "name": "$name",
-                "category": "$category",
-                "sellingPrice": $sellingPrice,
-                "timestamp": ${System.currentTimeMillis()}
+            StoreId.entries.forEach { store ->
+                stockDao.insertOrUpdateStock(
+                    StoreStockEntity(store.code, productId, initialStoreStocks[store.code] ?: 0)
+                )
             }
-        """.trimIndent()
-
-        pendingSyncDao.insertOperation(
-            PendingSyncOperationEntity(
-                mutationId = UUID.randomUUID().toString(),
-                entityType = "PRODUCT",
-                action = "CREATE",
-                payloadJson = payload,
-                idempotencyKey = "PRD-$productId",
-                status = "PENDING"
+            val payload = JSONObject()
+                .put("productId", productId)
+                .put("code", code)
+                .put("name", name)
+                .put("category", category)
+                .put("sellingPrice", sellingPrice)
+                .put("timestamp", System.currentTimeMillis())
+                .toString()
+            pendingSyncDao.insertOperation(
+                PendingSyncOperationEntity(
+                    mutationId = UUID.randomUUID().toString(),
+                    entityType = "PRODUCT",
+                    action = "CREATE",
+                    payloadJson = payload,
+                    idempotencyKey = "PRD-$productId",
+                    status = "PENDING"
+                )
             )
-        )
-        return productId
+            productId
+        }
     }
 
     suspend fun getSaleDetails(saleId: String): List<SaleItemEntity> {
@@ -496,7 +564,19 @@ class FanevaRepository(
         syncCursorDao.saveCursor(current.copy(isSimulatedOnline = isOnline))
     }
 
-    suspend fun resetDatabase() {
+    suspend fun resetDatabase(): Result<Unit> {
+        val hasUserData = database.productDao().countAll() > 0 ||
+            database.customerDao().countAll() > 0 ||
+            database.saleDao().countAll() > 0 ||
+            database.stockMovementDao().countAll() > 0 ||
+            database.debtPaymentDao().countAll() > 0 ||
+            database.pendingSyncDao().countAll() > 0
+        if (hasUserData) {
+            return Result.failure(
+                IllegalStateException("Réinitialisation refusée : la base contient des données utilisateur ou des opérations non acquittées.")
+            )
+        }
         FanevaDatabase.populateInitialDemoData(database)
+        return Result.success(Unit)
     }
 }

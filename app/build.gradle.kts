@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.fanevasystem.qxkp7z"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 4
+    versionName = "1.3"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -33,10 +33,10 @@ android {
       keyPassword = System.getenv("KEY_PASSWORD")
     }
     create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+      storeFile = file(System.getenv("DEBUG_KEYSTORE_PATH") ?: "${rootDir}/debug.keystore")
+      storePassword = System.getenv("DEBUG_STORE_PASSWORD") ?: "android"
+      keyAlias = System.getenv("DEBUG_KEY_ALIAS") ?: "androiddebugkey"
+      keyPassword = System.getenv("DEBUG_KEY_PASSWORD") ?: "android"
     }
   }
 

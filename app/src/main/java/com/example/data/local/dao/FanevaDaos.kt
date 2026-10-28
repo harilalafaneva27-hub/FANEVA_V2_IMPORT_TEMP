@@ -10,6 +10,9 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface ProductDao {
+    @Query("SELECT COUNT(*) FROM products")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM products WHERE isActive = 1 ORDER BY name ASC")
     fun getAllProducts(): Flow<List<ProductEntity>>
 
@@ -56,11 +59,14 @@ interface StoreStockDao {
     suspend fun insertAll(stocks: List<StoreStockEntity>)
 
     @Query("UPDATE store_stocks SET quantity = :newQty, lastUpdated = :now WHERE productId = :productId AND storeId = :storeId")
-    suspend fun updateQuantity(productId: Long, storeId: String, newQty: Int, now: Long = System.currentTimeMillis())
+    suspend fun updateQuantity(productId: Long, storeId: String, newQty: Int, now: Long = System.currentTimeMillis()): Int
 }
 
 @Dao
 interface CustomerDao {
+    @Query("SELECT COUNT(*) FROM customers")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM customers ORDER BY name ASC")
     fun getAllCustomers(): Flow<List<CustomerEntity>>
 
@@ -82,6 +88,9 @@ interface CustomerDao {
 
 @Dao
 interface SaleDao {
+    @Query("SELECT COUNT(*) FROM sales")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM sales ORDER BY createdAt DESC")
     fun getAllSales(): Flow<List<SaleEntity>>
 
@@ -109,6 +118,9 @@ interface SaleDao {
 
 @Dao
 interface StockMovementDao {
+    @Query("SELECT COUNT(*) FROM stock_movements")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM stock_movements ORDER BY createdAt DESC")
     fun getAllMovements(): Flow<List<StockMovementEntity>>
 
@@ -121,11 +133,20 @@ interface StockMovementDao {
 
 @Dao
 interface DebtPaymentDao {
+    @Query("SELECT COUNT(*) FROM debt_payments")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM debt_payments ORDER BY createdAt DESC")
     fun getAllPayments(): Flow<List<DebtPaymentEntity>>
 
+    @Query("SELECT * FROM debt_payments ORDER BY createdAt DESC")
+    suspend fun getAllPaymentsSnapshot(): List<DebtPaymentEntity>
+
     @Query("SELECT * FROM debt_payments WHERE customerId = :customerId ORDER BY createdAt DESC")
     fun getPaymentsForCustomer(customerId: Long): Flow<List<DebtPaymentEntity>>
+
+    @Query("SELECT * FROM debt_payments WHERE idempotencyKey = :idempotencyKey LIMIT 1")
+    suspend fun getPaymentByIdempotencyKey(idempotencyKey: String): DebtPaymentEntity?
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertPayment(payment: DebtPaymentEntity)
@@ -133,16 +154,25 @@ interface DebtPaymentDao {
 
 @Dao
 interface PendingSyncDao {
+    @Query("SELECT COUNT(*) FROM pending_sync_operations")
+    suspend fun countAll(): Int
+
     @Query("SELECT * FROM pending_sync_operations ORDER BY createdAt ASC")
     fun getAllPendingOperations(): Flow<List<PendingSyncOperationEntity>>
 
     @Query("SELECT * FROM pending_sync_operations ORDER BY createdAt ASC")
     suspend fun getPendingOperationsSnapshot(): List<PendingSyncOperationEntity>
 
-    @Query("SELECT COUNT(*) FROM pending_sync_operations WHERE status = 'PENDING' OR status = 'FAILED'")
+    @Query("SELECT COUNT(*) FROM pending_sync_operations WHERE status IN ('PENDING', 'SYNCING', 'FAILED')")
     fun getPendingCount(): Flow<Int>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Query("SELECT * FROM pending_sync_operations WHERE idempotencyKey = :idempotencyKey LIMIT 1")
+    suspend fun getByIdempotencyKey(idempotencyKey: String): PendingSyncOperationEntity?
+
+    @Query("UPDATE pending_sync_operations SET status = 'PENDING', lastError = 'Reprise après interruption locale' WHERE status = 'SYNCING'")
+    suspend fun recoverAbandonedSyncingOperations(): Int
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertOperation(op: PendingSyncOperationEntity)
 
     @Update

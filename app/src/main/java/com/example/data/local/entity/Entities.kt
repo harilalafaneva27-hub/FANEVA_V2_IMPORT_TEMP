@@ -143,7 +143,7 @@ data class PendingSyncOperationEntity(
 data class SyncCursorEntity(
     @PrimaryKey val id: Int = 1,
     val lastCursor: Long = 0L,
-    val stagingApiUrl: String = "https://staging-api.fanevasystem.workers.dev",
+    val stagingApiUrl: String = "",
     val isSimulatedOnline: Boolean = true,
     val lastSyncTimestamp: Long = 0L
 )
