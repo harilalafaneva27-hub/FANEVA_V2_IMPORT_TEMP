@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - automation/release-signing-run16
   pull_request:
     branches:
       - main
@@ -67,6 +68,63 @@ jobs:
 
       - name: Run debug unit tests
         run: ./gradlew --no-daemon --console=plain :app:testDebugUnitTest
+
+      - name: Prepare release keystore
+        if: github.event_name != "pull_request"
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_KEYSTORE_BASE64"
+          umask 077
+          printf "%s" "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/faneva-release.jks"
+          test -s "$RUNNER_TEMP/faneva-release.jks"
+
+      - name: Build signed release APK
+        if: github.event_name != "pull_request"
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/faneva-release.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --console=plain :app:assembleRelease
+
+      - name: Verify release APK and checksum
+        if: github.event_name != "pull_request"
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+          test -s "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee release-signature.txt
+          ACTUAL=$(grep -m1 "Signer #1 certificate SHA-256 digest:" release-signature.txt | sed "s/.*: //" | tr -d ":[:space:]" | tr "[:upper:]" "[:lower:]")
+          EXPECTED="c07b9cb863fb326a0b5af9c236786755043f6ee06f025fa1d9c89d487f3ed464"
+          test "$ACTUAL" = "$EXPECTED"
+          BADGING=$("$AAPT" dump badging "$APK")
+          printf "%s\n" "$BADGING" | grep -F "package: name='com.aistudio.fanevasystem.qxkp7z'"
+          printf "%s\n" "$BADGING" | grep -F "versionCode='5'"
+          printf "%s\n" "$BADGING" | grep -F "versionName='1.4'"
+          sha256sum "$APK" > app-release.apk.sha256
+          cat app-release.apk.sha256
+
+      - name: Clean up release keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/faneva-release.jks"
+
+      - name: Upload signed release artifacts
+        if: github.event_name != "pull_request"
+        uses: actions/upload-artifact@v4
+        with:
+          name: faneva-v2-release-apk
+          path: |
+            app/build/outputs/apk/release/app-release.apk
+            app-release.apk.sha256
+            release-signature.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Build debug APK
         id: apk
