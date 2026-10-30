@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - audit/room3-corrections
   pull_request:
     branches:
       - main
@@ -43,6 +44,18 @@ jobs:
           sdkmanager "platform-tools" \
                      "platforms;android-36.1" \
                      "build-tools;36.0.0"
+
+      - name: Generate Room v2 schema
+        run: ./gradlew --no-daemon --console=plain :app:kspDebugKotlin
+
+      - name: Upload Room schema v2 artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: faneva-room-schema-v2
+          path: app/schemas/**
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Prepare persistent or temporary debug keystore
         shell: bash

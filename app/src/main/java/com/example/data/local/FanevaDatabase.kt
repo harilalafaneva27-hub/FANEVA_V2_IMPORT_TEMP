@@ -27,7 +27,7 @@ import java.util.UUID
         AuthAccountEntity::class
     ],
     version = 2,
-    exportSchema = false
+    exportSchema = true
 )
 abstract class FanevaDatabase : RoomDatabase() {
 
