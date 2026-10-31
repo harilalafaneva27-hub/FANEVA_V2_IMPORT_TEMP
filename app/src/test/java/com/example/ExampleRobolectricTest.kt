@@ -6,6 +6,8 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.FanevaDatabase
 import com.example.data.local.entity.CustomerEntity
 import com.example.data.local.entity.ProductEntity
+import com.example.data.local.entity.TransferRequestEntity
+import com.example.data.local.entity.UserPreferenceEntity
 import com.example.data.local.entity.StoreStockEntity
 import com.example.data.repository.FanevaRepository
 import com.example.domain.model.CartItem
@@ -324,6 +326,263 @@ class ExampleRobolectricTest {
         // A1 must now be 10 + 15 = 25
         assertEquals(35, database.storeStockDao().getStock(productId, "A2")?.quantity)
         assertEquals(25, database.storeStockDao().getStock(productId, "A1")?.quantity)
+    }
+
+    @Test
+    fun `transfer retry with same key does not duplicate stock movement or outbox`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-IDEMP-01",
+                name = "Produit canonique",
+                category = "Test",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A2", productId, 10))
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A1", productId, 2))
+
+        val first = repository.transferStock(
+            productId = productId,
+            productName = "Nom fourni par UI",
+            fromStoreId = "A2",
+            toStoreId = "A1",
+            quantity = 3,
+            operatorName = "Test",
+            reason = "Retry test",
+            idempotencyKey = "TRANSFER-IDEMP-01"
+        )
+        val retry = repository.transferStock(
+            productId = productId,
+            productName = "Autre nom UI",
+            fromStoreId = "A2",
+            toStoreId = "A1",
+            quantity = 3,
+            operatorName = "Test",
+            reason = "Retry test",
+            idempotencyKey = "TRANSFER-IDEMP-01"
+        )
+
+        assertTrue(first.isSuccess)
+        assertTrue(retry.isSuccess)
+        assertEquals(7, database.storeStockDao().getStock(productId, "A2")?.quantity)
+        assertEquals(5, database.storeStockDao().getStock(productId, "A1")?.quantity)
+        assertEquals(1, database.stockMovementDao().countAll())
+        assertEquals(1, database.pendingSyncDao().countAll())
+
+        val request = database.transferRequestDao()
+            .getByIdempotencyKey("TRANSFER-IDEMP-01")
+        assertEquals("COMPLETED", request?.status)
+        assertEquals("Produit canonique", request?.productName)
+
+        val payload = database.pendingSyncDao()
+            .getByIdempotencyKey("TRANSFER-IDEMP-01")!!.payloadJson
+        assertEquals("Produit canonique", JSONObject(payload).getString("productName"))
+    }
+
+    @Test
+    fun `transfer idempotency key reused with different payload is rejected without mutation`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-IDEMP-02",
+                name = "Produit conflit",
+                category = "Test",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A2", productId, 10))
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A1", productId, 1))
+
+        val first = repository.transferStock(
+            productId, "Produit conflit", "A2", "A1", 3,
+            "Test", "Demande initiale", "TRANSFER-CONFLICT-01"
+        )
+        val conflict = repository.transferStock(
+            productId, "Produit conflit", "A2", "A1", 4,
+            "Test", "Demande initiale", "TRANSFER-CONFLICT-01"
+        )
+
+        assertTrue(first.isSuccess)
+        assertFalse(conflict.isSuccess)
+        assertEquals(7, database.storeStockDao().getStock(productId, "A2")?.quantity)
+        assertEquals(4, database.storeStockDao().getStock(productId, "A1")?.quantity)
+        assertEquals(1, database.stockMovementDao().countAll())
+        assertEquals(1, database.pendingSyncDao().countAll())
+    }
+
+    @Test
+    fun `clearing active transfer key preserves it while request is prepared`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-KEYGUARD-01",
+                name = "Produit keyguard",
+                category = "Test",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+
+        val key = "TRANSFER-KEYGUARD-01"
+
+        database.userPreferenceDao().savePreferences(
+            UserPreferenceEntity(activeTransferIdempotencyKey = key)
+        )
+
+        database.transferRequestDao().insertRequest(
+            TransferRequestEntity(
+                idempotencyKey = key,
+                productId = productId,
+                productName = "Produit keyguard",
+                fromStoreId = "A2",
+                toStoreId = "A1",
+                quantity = 1,
+                operatorName = "Test keyguard",
+                reason = "Test conservation de clé",
+                status = "PREPARED",
+                createdAt = System.currentTimeMillis(),
+                completedAt = null
+            )
+        )
+
+        repository.clearTransferIdempotencyKey(key)
+
+        assertEquals(
+            "La clé active doit être conservée tant que le transfert est PREPARED",
+            key,
+            database.userPreferenceDao().getPreferences()?.activeTransferIdempotencyKey
+        )
+        assertEquals(
+            "PREPARED",
+            database.transferRequestDao().getByIdempotencyKey(key)?.status
+        )
+    }
+
+    @Test
+    fun `prepared transfer recovery completes once and clears active key`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-RECOVERY-01",
+                name = "Produit recovery",
+                category = "Test",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A2", productId, 9))
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A1", productId, 1))
+
+        val key = "TRANSFER-RECOVERY-01"
+        database.userPreferenceDao().savePreferences(
+            UserPreferenceEntity(activeTransferIdempotencyKey = key)
+        )
+        database.transferRequestDao().insertRequest(
+            TransferRequestEntity(
+                idempotencyKey = key,
+                productId = productId,
+                productName = "Produit recovery",
+                fromStoreId = "A2",
+                toStoreId = "A1",
+                quantity = 4,
+                operatorName = "Test recovery",
+                reason = "Reprise après interruption",
+                status = "PREPARED",
+                createdAt = System.currentTimeMillis(),
+                completedAt = null
+            )
+        )
+
+        val results = repository.recoverPreparedTransfers()
+        val secondRecovery = repository.recoverPreparedTransfers()
+        assertTrue(secondRecovery.isEmpty())
+        assertEquals(1, database.stockMovementDao().countAll())
+        assertEquals(1, database.pendingSyncDao().countAll())
+
+        assertEquals(1, results.size)
+        assertTrue(results.single().isSuccess)
+        assertEquals(5, database.storeStockDao().getStock(productId, "A2")?.quantity)
+        assertEquals(5, database.storeStockDao().getStock(productId, "A1")?.quantity)
+        assertEquals(1, database.stockMovementDao().countAll())
+        assertEquals(1, database.pendingSyncDao().countAll())
+        assertEquals(
+            "COMPLETED",
+            database.transferRequestDao().getByIdempotencyKey(key)?.status
+        )
+        assertNull(database.userPreferenceDao().getPreferences()?.activeTransferIdempotencyKey)
+    }
+
+    @Test
+    fun `prepared transfer recovery rejects insufficient stock without mutation`() = runBlocking {
+        val productId = database.productDao().insertProduct(
+            ProductEntity(
+                code = "PRD-RECOVERY-02",
+                name = "Produit stock limité",
+                category = "Test",
+                purchasePrice = 10.0,
+                sellingPrice = 20.0
+            )
+        )
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A2", productId, 2))
+        database.storeStockDao().insertOrUpdateStock(StoreStockEntity("A1", productId, 1))
+
+        val key = "TRANSFER-RECOVERY-02"
+        database.userPreferenceDao().savePreferences(
+            UserPreferenceEntity(activeTransferIdempotencyKey = key)
+        )
+        database.transferRequestDao().insertRequest(
+            TransferRequestEntity(
+                idempotencyKey = key,
+                productId = productId,
+                productName = "Produit stock limité",
+                fromStoreId = "A2",
+                toStoreId = "A1",
+                quantity = 5,
+                operatorName = "Test recovery",
+                reason = "Stock insuffisant",
+                status = "PREPARED",
+                createdAt = System.currentTimeMillis(),
+                completedAt = null
+            )
+        )
+
+        val results = repository.recoverPreparedTransfers()
+
+        assertEquals(1, results.size)
+        assertFalse(results.single().isSuccess)
+        assertEquals(2, database.storeStockDao().getStock(productId, "A2")?.quantity)
+        assertEquals(1, database.storeStockDao().getStock(productId, "A1")?.quantity)
+        assertEquals(0, database.stockMovementDao().countAll())
+        assertEquals(0, database.pendingSyncDao().countAll())
+        assertEquals(
+            "REJECTED",
+            database.transferRequestDao().getByIdempotencyKey(key)?.status
+        )
+        assertNull(database.userPreferenceDao().getPreferences()?.activeTransferIdempotencyKey)
+    }
+
+    @Test
+    fun `updating user preferences preserves active transfer key`() = runBlocking {
+        val key = "TRANSFER-PREFERENCE-01"
+        database.userPreferenceDao().savePreferences(
+            UserPreferenceEntity(
+                activeRole = "ADMIN",
+                activeStoreId = "A1",
+                operatorName = "Ancien opérateur",
+                activeTransferIdempotencyKey = key
+            )
+        )
+
+        repository.updateUserPreference(
+            role = "GERANT",
+            storeId = "A2",
+            operator = "Nouvel opérateur"
+        )
+
+        val updated = database.userPreferenceDao().getPreferences()
+        assertEquals("GERANT", updated?.activeRole)
+        assertEquals("A2", updated?.activeStoreId)
+        assertEquals("Nouvel opérateur", updated?.operatorName)
+        assertEquals(key, updated?.activeTransferIdempotencyKey)
     }
 
     @Test

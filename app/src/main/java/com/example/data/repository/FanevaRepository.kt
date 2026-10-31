@@ -22,6 +22,7 @@ class FanevaRepository(
     private val pendingSyncDao = database.pendingSyncDao()
     private val syncCursorDao = database.syncCursorDao()
     private val userPreferenceDao = database.userPreferenceDao()
+    private val transferRequestDao = database.transferRequestDao()
 
     // Flows
     val allProducts: Flow<List<ProductEntity>> = productDao.getAllProducts()
@@ -274,8 +275,53 @@ class FanevaRepository(
     }
 
     /**
-     * Transfert de stock inter-magasins (A1..A5) avec vérification de stock source
+     * Transfert inter-magasins avec registre durable d'idempotence.
+     *
+     * PREPARED est enregistré dans une transaction séparée.
+     * Stock, mouvement, outbox et COMPLETED sont ensuite atomiques.
      */
+    /**
+     * Retourne la clé durable du transfert en cours.
+     * Une clé existante est toujours réutilisée, même si le transfert
+     * est déjà terminé, afin d'éviter toute double exécution après interruption.
+     */
+    suspend fun getOrCreateTransferIdempotencyKey(): String {
+        return database.withTransaction {
+            val preferences = userPreferenceDao.getPreferences()
+                ?: UserPreferenceEntity().also {
+                    userPreferenceDao.savePreferences(it)
+                }
+
+            val currentKey = preferences.activeTransferIdempotencyKey
+            if (!currentKey.isNullOrBlank()) {
+                return@withTransaction currentKey
+            }
+
+            val newKey = UUID.randomUUID().toString()
+            userPreferenceDao.savePreferences(
+                preferences.copy(activeTransferIdempotencyKey = newKey)
+            )
+            newKey
+        }
+    }
+
+    /**
+     * Efface uniquement la clé correspondant à la requête terminée.
+     */
+    suspend fun clearTransferIdempotencyKey(key: String) {
+        database.withTransaction {
+            val request = transferRequestDao.getByIdempotencyKey(key)
+
+            if (
+                request == null ||
+                request.status == "COMPLETED" ||
+                request.status == "REJECTED"
+            ) {
+                userPreferenceDao.clearActiveTransferKey(key)
+            }
+        }
+    }
+
     suspend fun transferStock(
         productId: Long,
         productName: String,
@@ -286,79 +332,240 @@ class FanevaRepository(
         reason: String,
         idempotencyKey: String = UUID.randomUUID().toString()
     ): TransferValidationResult {
+        val key = idempotencyKey.trim()
+        if (key.isBlank()) {
+            return TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "Clé d'idempotence invalide."
+            )
+        }
+
         if (fromStoreId == toStoreId) {
-            return TransferValidationResult(isSuccess = false, errorMessage = "Le magasin d'origine et de destination doivent être distincts")
+            return TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "Les magasins source et destinataire doivent être distincts."
+            )
         }
+
         if (quantity <= 0) {
-            return TransferValidationResult(isSuccess = false, errorMessage = "La quantité à transférer doit être strictement positive")
+            return TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "La quantité doit être strictement positive."
+            )
         }
 
+        if (StoreId.entries.none { it.code == fromStoreId } ||
+            StoreId.entries.none { it.code == toStoreId }) {
+            return TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "Magasin source ou destinataire inconnu."
+            )
+        }
+
+        val normalizedReason = reason.trim().ifBlank {
+            "Transfert de $fromStoreId vers $toStoreId"
+        }
+
+        val prepared = database.withTransaction {
+            val existing = transferRequestDao.getByIdempotencyKey(key)
+
+            if (existing != null) {
+                val sameRequest =
+                    existing.productId == productId &&
+                    existing.fromStoreId == fromStoreId &&
+                    existing.toStoreId == toStoreId &&
+                    existing.quantity == quantity &&
+                    existing.operatorName == operatorName &&
+                    existing.reason == normalizedReason
+
+                if (!sameRequest) {
+                    return@withTransaction null
+                }
+                existing
+            } else {
+                val canonicalProduct = productDao.getProductById(productId)
+                    ?: return@withTransaction null
+
+                val requested = TransferRequestEntity(
+                    idempotencyKey = key,
+                    productId = productId,
+                    productName = canonicalProduct.name,
+                    fromStoreId = fromStoreId,
+                    toStoreId = toStoreId,
+                    quantity = quantity,
+                    operatorName = operatorName,
+                    reason = normalizedReason,
+                    status = "PREPARED",
+                    createdAt = System.currentTimeMillis(),
+                    completedAt = null
+                )
+                transferRequestDao.insertRequest(requested)
+                requested
+            }
+        } ?: return TransferValidationResult(
+            isSuccess = false,
+            errorMessage = "Conflit ou produit introuvable pour cette demande de transfert."
+        )
+
+        if (prepared.status == "COMPLETED") {
+            return TransferValidationResult(
+                isSuccess = true,
+                transferId = key
+            )
+        }
+
+        if (prepared.status == "REJECTED") {
+            return TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "Ce transfert a déjà été rejeté. Créez une nouvelle demande."
+            )
+        }
+
+        return completePreparedTransfer(prepared)
+    }
+
+    private suspend fun rejectPreparedTransfer(
+        stored: TransferRequestEntity,
+        message: String
+    ): TransferValidationResult {
+        val updatedRows = transferRequestDao.updateRequest(
+            stored.copy(
+                status = "REJECTED",
+                completedAt = null
+            )
+        )
+
+        check(updatedRows == 1) {
+            "État REJECTED du transfert non enregistré."
+        }
+
+        return TransferValidationResult(
+            isSuccess = false,
+            errorMessage = message
+        )
+    }
+
+    private suspend fun completePreparedTransfer(
+        request: TransferRequestEntity
+    ): TransferValidationResult {
         return database.withTransaction {
-            if (pendingSyncDao.getByIdempotencyKey(idempotencyKey) != null) {
-                return@withTransaction TransferValidationResult(isSuccess = true, transferId = idempotencyKey)
+            val stored = transferRequestDao.getByIdempotencyKey(
+                request.idempotencyKey
+            ) ?: return@withTransaction TransferValidationResult(
+                isSuccess = false,
+                errorMessage = "Demande de transfert introuvable."
+            )
+
+            if (stored.status == "COMPLETED") {
+                return@withTransaction TransferValidationResult(
+                    isSuccess = true,
+                    transferId = stored.idempotencyKey
+                )
             }
-            if (StoreId.entries.none { it.code == fromStoreId } || StoreId.entries.none { it.code == toStoreId }) {
-                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Magasin source ou destinataire inconnu")
+
+            if (stored.status != "PREPARED") {
+                return@withTransaction TransferValidationResult(
+                    isSuccess = false,
+                    errorMessage = "État de transfert non reconnu : ${stored.status}"
+                )
             }
-            if (productDao.getProductById(productId) == null) {
-                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Produit introuvable")
+
+            if (StoreId.entries.none { it.code == stored.fromStoreId } ||
+                StoreId.entries.none { it.code == stored.toStoreId }) {
+                return@withTransaction rejectPreparedTransfer(stored, "Magasin source ou destinataire inconnu.")
             }
-            val fromStockEntity = stockDao.getStock(productId, fromStoreId)
-            val toStockEntity = stockDao.getStock(productId, toStoreId)
+
+            if (stored.quantity <= 0 ||
+                stored.fromStoreId == stored.toStoreId) {
+                return@withTransaction rejectPreparedTransfer(stored, "Données de transfert invalides.")
+            }
+
+            if (productDao.getProductById(stored.productId) == null) {
+                return@withTransaction rejectPreparedTransfer(stored, "Produit introuvable.")
+            }
+
+            val fromStockEntity = stockDao.getStock(
+                stored.productId,
+                stored.fromStoreId
+            )
+            val toStockEntity = stockDao.getStock(
+                stored.productId,
+                stored.toStoreId
+            )
+
             if (fromStockEntity == null || toStockEntity == null) {
-                return@withTransaction TransferValidationResult(isSuccess = false, errorMessage = "Stock source ou destination introuvable")
+                return@withTransaction rejectPreparedTransfer(stored, "Stock source ou destination introuvable.")
             }
+
             val fromStock = fromStockEntity.quantity
-            if (fromStock < quantity) {
-                return@withTransaction TransferValidationResult(
-                    isSuccess = false,
-                    errorMessage = "Stock insuffisant dans le magasin d'origine $fromStoreId (Disponible: $fromStock, Requis: $quantity)"
-                )
-            }
-
             val toStock = toStockEntity.quantity
-            if (toStock > Int.MAX_VALUE - quantity) {
-                return@withTransaction TransferValidationResult(
-                    isSuccess = false,
-                    errorMessage = "Dépassement de capacité du stock destination."
-                )
+
+            if (fromStock < 0 || toStock < 0) {
+                return@withTransaction rejectPreparedTransfer(stored, "Transfert bloqué : un stock existant est négatif.")
             }
 
-            // Mise à jour des stocks
-            val newFromQty = fromStock - quantity
-            val newToQty = toStock + quantity
-            check(stockDao.updateQuantity(productId, fromStoreId, newFromQty) == 1) { "Stock source non mis à jour" }
-            check(stockDao.updateQuantity(productId, toStoreId, newToQty) == 1) { "Stock destination non mis à jour" }
+            if (fromStock < stored.quantity) {
+                return@withTransaction rejectPreparedTransfer(stored, "Stock insuffisant dans ${stored.fromStoreId} : disponible $fromStock, requis ${stored.quantity}.")
+            }
 
-            val transferId = idempotencyKey
-            val mvtNumber = "TRF-${UUID.randomUUID().toString().take(8).uppercase()}"
+            if (toStock > Int.MAX_VALUE - stored.quantity) {
+                return@withTransaction rejectPreparedTransfer(stored, "Dépassement de capacité du stock destination.")
+            }
+
+            val now = System.currentTimeMillis()
+            val newFromQty = fromStock - stored.quantity
+            val newToQty = toStock + stored.quantity
+
+            check(
+                stockDao.updateQuantity(
+                    stored.productId,
+                    stored.fromStoreId,
+                    newFromQty,
+                    now
+                ) == 1
+            ) { "Stock source non mis à jour." }
+
+            check(
+                stockDao.updateQuantity(
+                    stored.productId,
+                    stored.toStoreId,
+                    newToQty,
+                    now
+                ) == 1
+            ) { "Stock destination non mis à jour." }
+
+            val movementNumber =
+                "TRF-${UUID.randomUUID().toString().take(8).uppercase()}"
 
             movementDao.insertMovement(
                 StockMovementEntity(
                     id = UUID.randomUUID().toString(),
-                    movementNumber = mvtNumber,
-                    productId = productId,
-                    productName = productName,
-                    fromStoreId = fromStoreId,
-                    toStoreId = toStoreId,
-                    quantity = quantity,
+                    movementNumber = movementNumber,
+                    productId = stored.productId,
+                    productName = stored.productName,
+                    fromStoreId = stored.fromStoreId,
+                    toStoreId = stored.toStoreId,
+                    quantity = stored.quantity,
                     movementType = "TRANSFERT",
-                    referenceId = transferId,
-                    reason = if (reason.isBlank()) "Transfert de $fromStoreId vers $toStoreId" else reason,
-                    performedBy = operatorName
+                    referenceId = stored.idempotencyKey,
+                    reason = stored.reason,
+                    performedBy = stored.operatorName,
+                    createdAt = now
                 )
             )
 
             val payload = JSONObject()
-                .put("transferId", transferId)
-                .put("movementNumber", mvtNumber)
-                .put("productId", productId)
-                .put("fromStoreId", fromStoreId)
-                .put("toStoreId", toStoreId)
-                .put("quantity", quantity)
-                .put("operator", operatorName)
-                .put("idempotencyKey", idempotencyKey)
-                .put("timestamp", System.currentTimeMillis())
+                .put("transferId", stored.idempotencyKey)
+                .put("movementNumber", movementNumber)
+                .put("productId", stored.productId)
+                .put("productName", stored.productName)
+                .put("fromStoreId", stored.fromStoreId)
+                .put("toStoreId", stored.toStoreId)
+                .put("quantity", stored.quantity)
+                .put("operator", stored.operatorName)
+                .put("reason", stored.reason)
+                .put("idempotencyKey", stored.idempotencyKey)
+                .put("timestamp", now)
                 .toString()
 
             pendingSyncDao.insertOperation(
@@ -367,13 +574,50 @@ class FanevaRepository(
                     entityType = "TRANSFER",
                     action = "CREATE",
                     payloadJson = payload,
-                    idempotencyKey = transferId,
+                    idempotencyKey = stored.idempotencyKey,
                     status = "PENDING"
                 )
             )
 
-            TransferValidationResult(isSuccess = true, transferId = transferId)
+            val updatedRows = transferRequestDao.updateRequest(
+                stored.copy(
+                    status = "COMPLETED",
+                    completedAt = now
+                )
+            )
+
+            check(updatedRows == 1) {
+                "État COMPLETED du transfert non enregistré."
+            }
+
+            TransferValidationResult(
+                isSuccess = true,
+                transferId = stored.idempotencyKey
+            )
         }
+    }
+
+    suspend fun recoverPreparedTransfers(): List<TransferValidationResult> {
+        val preparedRequests = transferRequestDao.getPreparedRequests()
+        val results = preparedRequests.map { request ->
+            completePreparedTransfer(request)
+        }
+
+        database.withTransaction {
+            val activeKey = userPreferenceDao.getPreferences()
+                ?.activeTransferIdempotencyKey
+
+            if (!activeKey.isNullOrBlank()) {
+                val request = transferRequestDao.getByIdempotencyKey(activeKey)
+                if (request?.status == "COMPLETED" ||
+                    request?.status == "REJECTED"
+                ) {
+                    userPreferenceDao.clearActiveTransferKey(activeKey)
+                }
+            }
+        }
+
+        return results
     }
 
     /**
@@ -544,14 +788,16 @@ class FanevaRepository(
     }
 
     suspend fun updateUserPreference(role: String, storeId: String, operator: String) {
-        userPreferenceDao.savePreferences(
-            UserPreferenceEntity(
-                id = 1,
-                activeRole = role,
-                activeStoreId = storeId,
-                operatorName = operator
+        database.withTransaction {
+            val current = userPreferenceDao.getPreferences() ?: UserPreferenceEntity()
+            userPreferenceDao.savePreferences(
+                current.copy(
+                    activeRole = role,
+                    activeStoreId = storeId,
+                    operatorName = operator
+                )
             )
-        )
+        }
     }
 
     suspend fun updateStagingApiUrl(url: String) {

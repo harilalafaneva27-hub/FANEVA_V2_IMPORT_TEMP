@@ -153,5 +153,24 @@ data class UserPreferenceEntity(
     @PrimaryKey val id: Int = 1,
     val activeRole: String = "ADMIN", // "ADMIN", "GERANT", "VENDEUR"
     val activeStoreId: String = "A1", // A1..A5
-    val operatorName: String = "Harilala R. (Admin)"
+    val operatorName: String = "Harilala R. (Admin)",
+    val activeTransferIdempotencyKey: String? = null
+)
+
+@Entity(
+    tableName = "transfer_requests",
+    indices = [Index(value = ["status"])]
+)
+data class TransferRequestEntity(
+    @PrimaryKey val idempotencyKey: String,
+    val productId: Long,
+    val productName: String,
+    val fromStoreId: String,
+    val toStoreId: String,
+    val quantity: Int,
+    val operatorName: String,
+    val reason: String,
+    val status: String,
+    val createdAt: Long,
+    val completedAt: Long?
 )

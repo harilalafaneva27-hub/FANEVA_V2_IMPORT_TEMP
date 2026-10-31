@@ -58,7 +58,7 @@ interface StoreStockDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(stocks: List<StoreStockEntity>)
 
-    @Query("UPDATE store_stocks SET quantity = :newQty, lastUpdated = :now WHERE productId = :productId AND storeId = :storeId")
+    @Query("UPDATE store_stocks SET quantity = :newQty, lastUpdated = :now WHERE productId = :productId AND storeId = :storeId AND :newQty >= 0 AND quantity >= 0")
     suspend fun updateQuantity(productId: Long, storeId: String, newQty: Int, now: Long = System.currentTimeMillis()): Int
 }
 
@@ -207,4 +207,22 @@ interface UserPreferenceDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun savePreferences(pref: UserPreferenceEntity)
+
+    @Query("UPDATE user_preferences SET activeTransferIdempotencyKey = NULL WHERE id = 1 AND activeTransferIdempotencyKey = :key")
+    suspend fun clearActiveTransferKey(key: String): Int
+}
+
+@Dao
+interface TransferRequestDao {
+    @Query("SELECT * FROM transfer_requests WHERE idempotencyKey = :key LIMIT 1")
+    suspend fun getByIdempotencyKey(key: String): TransferRequestEntity?
+
+    @Query("SELECT * FROM transfer_requests WHERE status = 'PREPARED' ORDER BY createdAt ASC")
+    suspend fun getPreparedRequests(): List<TransferRequestEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertRequest(request: TransferRequestEntity)
+
+    @Update
+    suspend fun updateRequest(request: TransferRequestEntity): Int
 }

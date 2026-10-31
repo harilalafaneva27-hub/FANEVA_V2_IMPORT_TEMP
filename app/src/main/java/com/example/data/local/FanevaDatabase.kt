@@ -24,9 +24,10 @@ import java.util.UUID
         PendingSyncOperationEntity::class,
         SyncCursorEntity::class,
         UserPreferenceEntity::class,
-        AuthAccountEntity::class
+        AuthAccountEntity::class,
+        TransferRequestEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = true
 )
 abstract class FanevaDatabase : RoomDatabase() {
@@ -41,6 +42,7 @@ abstract class FanevaDatabase : RoomDatabase() {
     abstract fun syncCursorDao(): SyncCursorDao
     abstract fun userPreferenceDao(): UserPreferenceDao
     abstract fun authDao(): AuthDao
+    abstract fun transferRequestDao(): TransferRequestDao
 
     companion object {
         @Volatile
@@ -53,13 +55,45 @@ abstract class FanevaDatabase : RoomDatabase() {
                     FanevaDatabase::class.java,
                     "faneva_v2_db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .addCallback(FanevaDatabaseCallback(scope))
                     .build()
                 INSTANCE = instance
                 instance
             }
         }
+
+    val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE user_preferences ADD COLUMN activeTransferIdempotencyKey TEXT"
+            )
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS transfer_requests (
+                    idempotencyKey TEXT NOT NULL,
+                    productId INTEGER NOT NULL,
+                    productName TEXT NOT NULL,
+                    fromStoreId TEXT NOT NULL,
+                    toStoreId TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    operatorName TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    createdAt INTEGER NOT NULL,
+                    completedAt INTEGER,
+                    PRIMARY KEY(idempotencyKey)
+                )
+                """.trimIndent()
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_transfer_requests_status " +
+                "ON transfer_requests(status)"
+            )
+        }
+    }
+
+
 
         val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {

@@ -9,6 +9,7 @@ import com.example.data.repository.FanevaRepository
 import com.example.data.repository.SyncPushResult
 import com.example.data.repository.SyncRepository
 import com.example.domain.model.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -111,11 +112,30 @@ class FanevaViewModel(
     private val _syncMessage = MutableStateFlow<String?>(null)
     val syncMessage: StateFlow<String?> = _syncMessage.asStateFlow()
 
+    private val _transferRecoveryMessage = MutableStateFlow<String?>(null)
+    val transferRecoveryMessage: StateFlow<String?> =
+        _transferRecoveryMessage.asStateFlow()
+
     init {
         viewModelScope.launch {
             authRepository.ensureInitialAdmin()
             _authState.value = AuthUiState.SignedOut
         }
+        // Recover durable transfers left in PREPARED after interruption.
+        viewModelScope.launch {
+            try {
+                val recoveryResults = fanevaRepository.recoverPreparedTransfers()
+                val failedResult = recoveryResults.firstOrNull { !it.isSuccess }
+                _transferRecoveryMessage.value = failedResult?.errorMessage
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The failed DB transaction leaves the request PREPARED for retry.
+                _transferRecoveryMessage.value =
+                    e.message ?: "La reprise des transferts en attente a échoué."
+            }
+        }
+
         // Preferences are convenience settings only, never authentication evidence.
         viewModelScope.launch {
             fanevaRepository.userPreferences.collect { pref ->
@@ -299,15 +319,58 @@ class FanevaViewModel(
         onResult: (TransferValidationResult) -> Unit
     ) {
         viewModelScope.launch {
-            val result = fanevaRepository.transferStock(
-                productId = productId,
-                productName = productName,
-                fromStoreId = fromStore,
-                toStoreId = toStore,
-                quantity = quantity,
-                operatorName = _operatorName.value,
-                reason = reason
-            )
+            val idempotencyKey = try {
+                fanevaRepository.getOrCreateTransferIdempotencyKey()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onResult(
+                    TransferValidationResult(
+                        isSuccess = false,
+                        errorMessage = e.message
+                            ?: "Impossible de préparer le transfert."
+                    )
+                )
+                return@launch
+            }
+
+            val result = try {
+                fanevaRepository.transferStock(
+                    productId = productId,
+                    productName = productName,
+                    fromStoreId = fromStore,
+                    toStoreId = toStore,
+                    quantity = quantity,
+                    operatorName = _operatorName.value,
+                    reason = reason,
+                    idempotencyKey = idempotencyKey
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Keep the key so a retry uses the same request identity.
+                onResult(
+                    TransferValidationResult(
+                        isSuccess = false,
+                        errorMessage = e.message
+                            ?: "Erreur technique. Le transfert pourra être repris."
+                    )
+                )
+                return@launch
+            }
+
+            // The transfer result is already committed. If clearing the key
+            // fails, the repository can reconcile it from the durable ledger.
+            try {
+                fanevaRepository.clearTransferIdempotencyKey(idempotencyKey)
+                _transferRecoveryMessage.value = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _transferRecoveryMessage.value =
+                    e.message ?: "La clé du transfert sera réconciliée ultérieurement."
+            }
+
             onResult(result)
         }
     }
